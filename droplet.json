@@ -1,0 +1,39 @@
+{
+  "id": "happy-quick-ai",
+  "name": "Happy Quick-AI",
+  "version": "1.0.0",
+  "summary": "Chat with ChatGPT, Gemini, Claude, DeepSeek or OpenRouter",
+  "description": "An AI Assistant droplet for Droppy. Chat with ChatGPT, Google Gemini, Anthropic Claude, DeepSeek or OpenRouter directly from your shelf widget. Configure your API key, system prompt, and response language in Settings.",
+  "category": "AI",
+  "kit": {
+    "abi": 1,
+    "minAPI": "1.6.0"
+  },
+  "minAppVersion": "15.3.0",
+  "capabilities": [],
+  "surfaces": [
+    "shelf-widget",
+    "settings-pane"
+  ],
+  "icon": "HappyQuickAI.icon",
+  "creator": {
+    "name": "Andreb",
+    "kind": "community",
+    "url": "https://linktr.ee/soyandreb",
+    "avatar": "Creator.png"
+  },
+  "source": {
+    "repository": "https://github.com/SoyAndreb/happy-quick-ai",
+    "license": "MIT"
+  },
+  "keywords": [
+    "ai",
+    "chat",
+    "chatgpt",
+    "gemini",
+    "claude",
+    "deepseek",
+    "openrouter",
+    "assistant"
+  ]
+}
