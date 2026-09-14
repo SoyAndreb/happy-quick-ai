@@ -1,0 +1,10 @@
+---
+description: Happy Quick-AI is a Droplet for Droppy, built with DroppyKit. The brief, the build loop and the rules live in AGENTS.md at the package root.
+alwaysApply: true
+---
+
+Read `AGENTS.md` at the package root before changing anything in this package. It carries the loop (`droppykit build`, `droppykit validate`, `droppykit run -- --shots ./shots --report ./shots/report.json`), the rules a droplet must follow, and the on-disk paths of the DroppyKit guides and sources.
+
+The SDK checkout is a child of this package at `droppykit/`. Its scripts also need an Xcode toolchain with SwiftUI macros: export the Xcode-beta path before every build (see AGENTS.md) — the plain CommandLineTools build fails inside `droppykit/Sources/DroppyKit/DesignSystem/SettingsSlider.swift`.
+
+Never build the bundle with a bare `swift build`; only `droppykit build` produces one Droppy can load. Keep `droplet.json` `surfaces` and the droplet's protocol conformances in agreement. After every visual change render the shots and look at them: the DroppyKit MCP server in `.cursor/mcp.json` returns them inline through `droppykit_shots`, and `droppykit_install` puts the bundle into Droppy Playground and reports whether it loaded.

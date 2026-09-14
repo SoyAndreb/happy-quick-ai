@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "droppykit": {
+      "command": "~/droppykit/Scripts/droppykit",
+      "args": [
+        "mcp"
+      ]
+    }
+  }
+}
