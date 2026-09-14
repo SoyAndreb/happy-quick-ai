@@ -44,13 +44,3 @@ MCP server, which gives them the build, the checks, pictures of every surface
 and an install into Droppy Playground as tools. Codex registers the server
 once per Mac: `codex mcp add droppykit -- path/to/droppykit/Scripts/droppykit mcp`.
 Run `droppykit agent` again after moving this folder or the SDK checkout.
-
-## Before submitting
-
-- Replace `HappyQuickAI.icon` with real artwork, in Icon Composer.
-- Replace `Assets/Creator.png` with your own square, unrounded mark.
-- Keep `summary` ≤ 60 characters and update `description`, `keywords` in
-  `droplet.json` when providers change.
-- Push this repository, then `droppykit submit`: it opens
-  [getdroppy.app/submit-droplet](https://getdroppy.app/submit-droplet) with the
-  repository, the commit and the id filled in.
