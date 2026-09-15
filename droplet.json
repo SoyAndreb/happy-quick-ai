@@ -1,9 +1,9 @@
 {
   "id": "happy-quick-ai",
   "name": "Happy Quick-AI",
-  "version": "1.0.0",
-  "summary": "Chat with ChatGPT, Gemini, Claude, DeepSeek or OpenRouter",
-  "description": "An AI Assistant droplet for Droppy. Chat with ChatGPT, Google Gemini, Anthropic Claude, DeepSeek or OpenRouter directly from your shelf widget. Configure your API key, system prompt, and response language in Settings.",
+  "version": "1.0.1",
+  "summary": "A chat with AI, right on your shelf",
+  "description": "Happy Quick-AI is a chat assistant that lives on Droppy's shelf. It answers with rich Markdown — bold, lists, code blocks and separators — in the language of Droppy's interface, so the conversation reads naturally while you keep working. Bring the API key you already have from your favourite AI provider, or point it at your own OpenAI-compatible server; the chat stays on the shelf, ready whenever you are.",
   "category": "AI",
   "kit": {
     "abi": 1,
@@ -29,11 +29,17 @@
   "keywords": [
     "ai",
     "chat",
+    "assistant",
     "chatgpt",
     "gemini",
     "claude",
     "deepseek",
     "openrouter",
-    "assistant"
+    "api key",
+    "markdown",
+    "openai-compatible",
+    "self-hosted",
+    "ollama",
+    "shelf"
   ]
 }

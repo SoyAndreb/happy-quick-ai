@@ -33,10 +33,10 @@
       "blur-material" : 0.5,
       "layers" : [
         {
-          "fill" : "system-light",
+          "fill" : "automatic",
           "hidden" : false,
-          "image-name" : "sentiment_very_satisfied_1000dp_E3E3E3_FILL0_wght400_GRAD0_opsz48.png",
-          "name" : "sentiment_very_satisfied_1000dp_E3E3E3_FILL0_wght400_GRAD0_opsz48",
+          "image-name" : "Documento.png",
+          "name" : "Documento",
           "position" : {
             "scale" : 0.8,
             "translation-in-points" : [
