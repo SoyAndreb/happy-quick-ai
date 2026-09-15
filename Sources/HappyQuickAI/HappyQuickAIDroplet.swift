@@ -2,88 +2,70 @@
 //  HappyQuickAIDroplet.swift
 //  HappyQuickAI
 //
+//  The droplet object: preferences, lifecycle, the chat + model-list REST
+//  clients, and the state the views render.
+//
 
 import Combine
 import DroppyKit
-import SwiftUI
+import Foundation
 
-/// The class Droppy's loader instantiates, named in the bundle's `NSPrincipalClass`.
-@objc(HappyQuickAIPrincipal)
-public final class HappyQuickAIPrincipal: NSObject, DropletPrincipal {
-    public override init() { super.init() }
+/// One successful model fetch, kept so switching provider or reopening the
+/// settings pane does not re-hit the network for the same configuration.
+private struct ModelsCacheEntry {
+    let provider: AIProvider
+    let apiKey: String
+    let baseURL: String
+    let models: [String]
+    let date: Date
 
-    @MainActor public func makeDroplet() -> AnyObject { HappyQuickAIDroplet() }
-}
-
-// MARK: - Models
-
-public enum AIProvider: String, Codable, CaseIterable, Identifiable {
-    case chatGPT = "ChatGPT"
-    case gemini = "Gemini"
-    case claude = "Claude"
-    case deepseek = "DeepSeek"
-    case openRouter = "OpenRouter"
-
-    public var id: String { rawValue }
-
-    public var displayName: String {
-        switch self {
-        case .chatGPT: return "ChatGPT"
-        case .gemini: return "Gemini"
-        case .claude: return "Claude"
-        case .deepseek: return "DeepSeek"
-        case .openRouter: return "OpenRouter"
-        }
-    }
-
-    public var defaultModel: String {
-        switch self {
-        case .chatGPT: return "gpt-4o-mini"
-        case .gemini: return "gemini-2.5-flash"
-        case .claude: return "claude-sonnet-4-5"
-        case .deepseek: return "deepseek-chat"
-        case .openRouter: return "openrouter/auto"
-        }
-    }
-
-    public var fallbackModels: [String] {
-        switch self {
-        case .chatGPT: return ["gpt-4o-mini", "gpt-4o", "gpt-4-turbo", "o1-mini"]
-        case .gemini: return ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-1.5-flash", "gemini-1.5-pro"]
-        case .claude: return ["claude-sonnet-4-5", "claude-opus-4-1", "claude-3-7-sonnet-latest", "claude-3-5-haiku-latest"]
-        case .deepseek: return ["deepseek-chat", "deepseek-reasoner"]
-        case .openRouter: return ["openrouter/auto", "openrouter/auto:free", "meta-llama/llama-3.3-70b-instruct:free"]
-        }
+    /// Whether this entry still describes the current configuration and is
+    /// fresh enough to serve.
+    func isCurrent(provider: AIProvider, apiKey: String, baseURL: String, ttl: TimeInterval) -> Bool {
+        self.provider == provider
+            && self.apiKey == apiKey
+            && self.baseURL == baseURL
+            && Date().timeIntervalSince(date) < ttl
     }
 }
 
-public struct ChatMessage: Identifiable, Codable, Hashable {
-    public var id: UUID
-    public var role: MessageRole
-    public var content: String
-    public var timestamp: Date
+/// Where an OpenAI-compatible server lives and what a request to it looks like.
+private struct CustomEndpoints {
+    let chat: URL
+    let models: URL
 
-    public enum MessageRole: String, Codable {
-        case user
-        case assistant
-    }
+    /// Derives the two endpoints from whatever the user pasted: a base URL
+    /// (`https://host:port` or `https://host:port/v1`), or a full chat
+    /// completions path. The `/v1` prefix is assumed, matching LM Studio,
+    /// Ollama, vLLM, llama.cpp and the usual OpenAI clones.
+    init?(baseURL: String) {
+        let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
 
-    public init(id: UUID = UUID(), role: MessageRole, content: String, timestamp: Date = Date()) {
-        self.id = id
-        self.role = role
-        self.content = content
-        self.timestamp = timestamp
+        let chatString: String
+        if trimmed.contains("/chat/completions") {
+            chatString = trimmed
+        } else if trimmed.hasSuffix("/v1") {
+            chatString = trimmed + "/chat/completions"
+        } else {
+            chatString = trimmed + "/v1/chat/completions"
+        }
+
+        guard let chatURL = URL(string: chatString) else { return nil }
+        let modelsString = chatString.replacingOccurrences(of: "/chat/completions", with: "/models")
+        guard let modelsURL = URL(string: modelsString) else { return nil }
+
+        self.chat = chatURL
+        self.models = modelsURL
     }
 }
-
-// MARK: - Main Droplet Class
 
 @MainActor
 public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
     public nonisolated static let id: DropletID = "happy-quick-ai"
 
     public static let defaultSystemPrompt = """
-        You are an ultra-minimalist answer engine for Quick AI. Your goal is to deliver immediate value using the fewest characters possible.
+        You are an ultra-minimalist answer engine for Happy Quick-AI. Your goal is to deliver immediate value using the fewest characters possible.
 
         Response rules:
         1. ZERO pleasantries, introductions, or sign-offs (do not use "Sure," "Here you go," "Hello," or "Hope this helps").
@@ -92,6 +74,14 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
         4. If asked to translate, summarize, or correct text: return the final result directly, without quotation marks or explanatory text.
         5. Use clean Markdown formatting, prioritizing code and lists over dense paragraphs.
         """
+
+    /// How many messages the persisted history keeps at most. Sending is
+    /// always capped to the last 20; this bounds the stored blob itself.
+    private static let maxMessages = 200
+    /// How long a fetched model list is reused before the API is asked again.
+    private static let modelsCacheTTL: TimeInterval = 180
+    /// Debounce for re-fetching the model list while an API key is typed.
+    private static let modelRefreshDelay: UInt64 = 600_000_000
 
     @Published public var messages: [ChatMessage] = []
     @Published public var isGenerating: Bool = false
@@ -102,13 +92,25 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
     @Published public var isTestingConnection: Bool = false
     @Published public var connectionStatus: String? = nil
 
-    public static let supportedLanguages: [String] = [
-        "English", "Español", "Français", "Deutsch",
-        "Italiano", "Português", "日本語", "中文"
-    ]
-
     private var host: DropletHost?
     private var cancellables = Set<AnyCancellable>()
+
+    /// Guards every asynchronous continuation: while false (between
+    /// `deactivate()` and the next `activate(host:)`) in-flight work must not
+    /// touch `@Published` state or the host.
+    private var isActive = false
+    /// Every task the droplet started, cancelled wholesale on deactivation.
+    private var inFlightTasks: [Task<Void, Never>] = []
+    /// The debounced model-list refresh scheduled after an API key edit.
+    private var modelRefreshTask: Task<Void, Never>?
+
+    /// Bumped on every provider switch or fetch; only the newest fetch may
+    /// apply its result, so a slow response never overwrites a newer one.
+    private var modelFetchGeneration = 0
+    /// Which provider owns the currently displayed list.
+    private var modelsProvider: AIProvider?
+    /// The last successful fetch, for the TTL cache.
+    private var modelsCacheEntry: ModelsCacheEntry?
 
     private lazy var session: URLSession = {
         let config = URLSessionConfiguration.default
@@ -117,8 +119,11 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
         return URLSession(configuration: config)
     }()
 
+    // MARK: Lifecycle
+
     public func activate(host: DropletHost) throws {
         self.host = host
+        isActive = true
         host.log.info("Happy Quick-AI activated")
         loadMessages()
         updateAvailableModelsList()
@@ -131,11 +136,21 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
     }
 
     public func deactivate() {
+        isActive = false
         modelRefreshTask?.cancel()
         modelRefreshTask = nil
+        // A fetch already on the wire must not win its generation guard after
+        // reactivation either.
         modelFetchGeneration += 1
+        for task in inFlightTasks { task.cancel() }
+        inFlightTasks.removeAll()
         cancellables.removeAll()
         host = nil
+    }
+
+    /// Remembers a task so `deactivate()` can cancel it.
+    private func track(_ task: Task<Void, Never>) {
+        inFlightTasks.append(task)
     }
 
     // MARK: Preferences
@@ -147,7 +162,6 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
         }
         set {
             host?.preferences.setValue(newValue.rawValue, forKey: "provider")
-            objectWillChange.send()
             connectionStatus = nil
             updateAvailableModelsList()
         }
@@ -157,7 +171,6 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
         get { host?.preferences.value(forKey: "chatgptApiKey", default: "") ?? "" }
         set {
             host?.preferences.setValue(newValue, forKey: "chatgptApiKey")
-            objectWillChange.send()
             scheduleModelRefresh()
         }
     }
@@ -166,7 +179,6 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
         get { host?.preferences.value(forKey: "geminiApiKey", default: "") ?? "" }
         set {
             host?.preferences.setValue(newValue, forKey: "geminiApiKey")
-            objectWillChange.send()
             scheduleModelRefresh()
         }
     }
@@ -175,7 +187,6 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
         get { host?.preferences.value(forKey: "claudeApiKey", default: "") ?? "" }
         set {
             host?.preferences.setValue(newValue, forKey: "claudeApiKey")
-            objectWillChange.send()
             scheduleModelRefresh()
         }
     }
@@ -184,7 +195,6 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
         get { host?.preferences.value(forKey: "deepseekApiKey", default: "") ?? "" }
         set {
             host?.preferences.setValue(newValue, forKey: "deepseekApiKey")
-            objectWillChange.send()
             scheduleModelRefresh()
         }
     }
@@ -193,7 +203,24 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
         get { host?.preferences.value(forKey: "openRouterApiKey", default: "") ?? "" }
         set {
             host?.preferences.setValue(newValue, forKey: "openRouterApiKey")
-            objectWillChange.send()
+            scheduleModelRefresh()
+        }
+    }
+
+    public var customApiKey: String {
+        get { host?.preferences.value(forKey: "customApiKey", default: "") ?? "" }
+        set {
+            host?.preferences.setValue(newValue, forKey: "customApiKey")
+            scheduleModelRefresh()
+        }
+    }
+
+    /// Base address of the custom OpenAI-compatible server, for example
+    /// `http://localhost:8080/v1`.
+    public var customBaseURL: String {
+        get { host?.preferences.value(forKey: "customBaseURL", default: "") ?? "" }
+        set {
+            host?.preferences.setValue(newValue, forKey: "customBaseURL")
             scheduleModelRefresh()
         }
     }
@@ -205,7 +232,6 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
         }
         set {
             host?.preferences.setValue(newValue, forKey: "selectedModel_\(selectedProvider.rawValue)")
-            objectWillChange.send()
         }
     }
 
@@ -213,15 +239,25 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
         get { host?.preferences.value(forKey: "systemPrompt", default: Self.defaultSystemPrompt) ?? Self.defaultSystemPrompt }
         set {
             host?.preferences.setValue(newValue, forKey: "systemPrompt")
-            objectWillChange.send()
         }
     }
 
+    /// The language the AI answers in, taken from Droppy's own interface so
+    /// the chat always replies in the language the app is showing. There is no
+    /// setting for it; the terminator instruction is built from this.
     public var selectedLanguage: String {
-        get { host?.preferences.value(forKey: "selectedLanguage", default: "English") ?? "English" }
-        set {
-            host?.preferences.setValue(newValue, forKey: "selectedLanguage")
-            objectWillChange.send()
+        let appLanguage = Bundle.main.preferredLocalizations.first
+            ?? Locale.preferredLanguages.first
+            ?? "en"
+        switch appLanguage.prefix(2).lowercased() {
+        case "es": return "Español"
+        case "fr": return "Français"
+        case "de": return "Deutsch"
+        case "it": return "Italiano"
+        case "pt": return "Português"
+        case "ja": return "日本語"
+        case "zh": return "中文"
+        default: return "English"
         }
     }
 
@@ -232,7 +268,37 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
         case .claude: return claudeApiKey
         case .deepseek: return deepseekApiKey
         case .openRouter: return openRouterApiKey
+        case .custom: return customApiKey
         }
+    }
+
+    /// Whether the selected provider has everything it needs to send: a key
+    /// for the hosted providers, a base URL for a custom server.
+    public var isConfigured: Bool {
+        switch selectedProvider {
+        case .custom:
+            return !customBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        default:
+            return !activeApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
+    public var setupHintTitle: String {
+        selectedProvider == .custom ? "No AI server configured" : "No API key configured"
+    }
+
+    public var setupHintDetail: String {
+        if selectedProvider == .custom {
+            return "Paste your OpenAI-compatible server address in settings."
+        }
+        return "Set up your \(selectedProvider.displayName) API key in settings."
+    }
+
+    private var configurationErrorText: String {
+        if selectedProvider == .custom {
+            return "No API base URL configured. Paste your server address in Settings."
+        }
+        return "No API key provided for \(selectedProvider.displayName)."
     }
 
     public func openSettings() {
@@ -250,101 +316,119 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
     private func loadMessages() {
         if let data = host?.preferences.value(forKey: "chatHistory", as: Data.self),
            let decoded = try? JSONDecoder().decode([ChatMessage].self, from: data) {
-            self.messages = decoded
+            self.messages = Array(decoded.suffix(Self.maxMessages))
         }
     }
 
     private func saveMessages() {
-        if let encoded = try? JSONEncoder().encode(messages) {
+        let capped = Array(messages.suffix(Self.maxMessages))
+        if let encoded = try? JSONEncoder().encode(capped) {
             host?.preferences.setValue(encoded, forKey: "chatHistory")
+        }
+    }
+
+    private func capMessages() {
+        if messages.count > Self.maxMessages {
+            messages.removeFirst(messages.count - Self.maxMessages)
         }
     }
 
     // MARK: Dynamic Model Fetching
 
-    private var modelRefreshTask: Task<Void, Never>?
-
-    /// Bumped on every provider switch or fetch; only the newest fetch may apply
-    /// its result, so a slow response can never overwrite a newer provider's list.
-    private var modelFetchGeneration = 0
-    /// Which provider owns the currently displayed list.
-    private var modelsProvider: AIProvider?
-
-    /// Debounced re-fetch after an API key is edited, so pasting or typing a key
-    /// does not fire a request per keystroke.
+    /// Debounced re-fetch after an API key or base URL is edited, so pasting
+    /// or typing a key does not fire a request per keystroke.
     private func scheduleModelRefresh() {
         modelRefreshTask?.cancel()
         modelRefreshTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 600_000_000)
-            guard !Task.isCancelled else { return }
-            self?.updateAvailableModelsList()
+            try? await Task.sleep(nanoseconds: Self.modelRefreshDelay)
+            guard !Task.isCancelled, let self, self.isActive else { return }
+            self.updateAvailableModelsList()
         }
     }
 
     public func updateAvailableModelsList() {
         let provider = selectedProvider
-        let apiKey = activeApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-
         modelFetchGeneration += 1
         let generation = modelFetchGeneration
 
-        guard !apiKey.isEmpty else {
+        let apiKey = activeApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let baseURL = provider.usesBaseURL
+            ? customBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            : ""
+
+        guard isConfigured else {
             isFetchingModels = false
             modelsFetchError = nil
-            availableModels = provider.fallbackModels
-            modelsProvider = provider
-            if !availableModels.contains(selectedModel) {
-                selectedModel = provider.defaultModel
-            }
+            applyModelList(provider.fallbackModels, for: provider)
+            return
+        }
+
+        // A fresh cached list is exact — no network call just because the pane
+        // reopened or the provider was switched once.
+        if let cache = modelsCacheEntry, cache.isCurrent(provider: provider, apiKey: apiKey, baseURL: baseURL, ttl: Self.modelsCacheTTL) {
+            applyModelList(cache.models, for: provider)
             return
         }
 
         isFetchingModels = true
         modelsFetchError = nil
 
-        Task { @MainActor in
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
             let fetched: [String]
             do {
-                fetched = try await self.listModels(provider: provider, apiKey: apiKey)
+                fetched = try await self.listModels(provider: provider, apiKey: apiKey, baseURL: baseURL)
             } catch {
-                guard generation == self.modelFetchGeneration else { return }
-                self.modelsFetchError = (error as NSError).localizedDescription
+                guard generation == self.modelFetchGeneration, self.isActive else { return }
+                self.modelsFetchError = error.localizedDescription
                 // Keep the previous list only when it belongs to this provider;
                 // otherwise fall back to this provider's defaults.
                 if self.modelsProvider != provider {
-                    self.availableModels = provider.fallbackModels
-                    self.modelsProvider = provider
+                    self.applyModelList(provider.fallbackModels, for: provider)
+                } else {
+                    self.isFetchingModels = false
                 }
-                self.isFetchingModels = false
                 return
             }
 
-            guard generation == self.modelFetchGeneration else { return }
+            guard generation == self.modelFetchGeneration, self.isActive else { return }
 
             // A successful fetch always wins: show exactly what this provider
             // returned (deduped), never a leftover from another provider.
-            if fetched.isEmpty {
-                self.availableModels = provider.fallbackModels
-            } else {
-                var seen = Set<String>()
-                self.availableModels = fetched.filter { seen.insert($0).inserted }
-            }
-            self.modelsProvider = provider
-            self.modelsFetchError = nil
-            if !self.availableModels.contains(self.selectedModel) {
-                self.selectedModel = self.availableModels.first ?? provider.defaultModel
-            }
-            self.isFetchingModels = false
+            var seen = Set<String>()
+            let models = fetched.filter { seen.insert($0).inserted }
+            self.modelsCacheEntry = ModelsCacheEntry(
+                provider: provider,
+                apiKey: apiKey,
+                baseURL: baseURL,
+                models: models,
+                date: Date()
+            )
+            self.applyModelList(models, for: provider)
         }
+        track(task)
     }
 
-    private func listModels(provider: AIProvider, apiKey: String) async throws -> [String] {
+    /// Applies a model list to the state, staying on the typed choice for the
+    /// custom provider, where the model name is the user's to decide.
+    private func applyModelList(_ models: [String], for provider: AIProvider) {
+        availableModels = models.isEmpty ? provider.fallbackModels : models
+        modelsProvider = provider
+        modelsFetchError = nil
+        if !availableModels.contains(selectedModel), provider != .custom {
+            selectedModel = availableModels.first ?? provider.defaultModel
+        }
+        isFetchingModels = false
+    }
+
+    private func listModels(provider: AIProvider, apiKey: String, baseURL: String) async throws -> [String] {
         switch provider {
         case .chatGPT: return try await fetchOpenAIModels(apiKey: apiKey)
         case .gemini: return try await fetchGeminiModels(apiKey: apiKey)
         case .claude: return try await fetchClaudeModels(apiKey: apiKey)
         case .deepseek: return try await fetchDeepSeekModels(apiKey: apiKey)
         case .openRouter: return try await fetchOpenRouterModels(apiKey: apiKey)
+        case .custom: return try await fetchOpenAICompatibleModels(apiKey: apiKey, baseURL: baseURL)
         }
     }
 
@@ -353,35 +437,38 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
         return "\(key.prefix(4))…\(key.suffix(4)) (length \(key.count))"
     }
 
-    /// Sends the stored key to the chosen provider's models endpoint so the
-    /// user can see, with the server's own answer, whether the key is valid.
+    /// Sends the stored configuration to the chosen provider's models endpoint
+    /// so the user can see, with the server's own answer, whether it works.
     public func testConnection() async {
         let provider = selectedProvider
         let apiKey = activeApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let baseURL = provider.usesBaseURL
+            ? customBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            : ""
 
-        await MainActor.run { isTestingConnection = true }
+        isTestingConnection = true
         connectionStatus = nil
         defer { isTestingConnection = false }
 
-        guard !apiKey.isEmpty else {
-            await MainActor.run {
-                self.connectionStatus = "No API key stored for \(provider.displayName). Paste it above."
-            }
+        guard isConfigured else {
+            connectionStatus = "Configure \(provider.displayName) in Settings first."
             return
         }
 
-        let masked = maskedKey(apiKey)
+        let credential: String
+        if provider.usesBaseURL {
+            credential = baseURL
+        } else {
+            credential = "key \(maskedKey(apiKey))"
+        }
+
         do {
-            let models = try await listModels(provider: provider, apiKey: apiKey)
-            let count = models.count
-            await MainActor.run {
-                self.connectionStatus = "OK — \(provider.displayName) accepted key \(masked) (\(count) models)."
-            }
+            let models = try await listModels(provider: provider, apiKey: apiKey, baseURL: baseURL)
+            guard isActive else { return }
+            connectionStatus = "OK — \(provider.displayName) accepted \(credential) (\(models.count) models)."
         } catch {
-            let message = (error as NSError).localizedDescription
-            await MainActor.run {
-                self.connectionStatus = "Rejected (\(provider.displayName)): \(message) — key \(masked)."
-            }
+            guard isActive else { return }
+            connectionStatus = "Rejected (\(provider.displayName)): \(error.localizedDescription) — \(credential)."
         }
     }
 
@@ -392,8 +479,11 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
 
         let (data, response) = try await session.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-            throw NSError(domain: "OpenAI", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to fetch models."])
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw APIError.invalidURL(domain: "OpenAI")
+        }
+        guard httpResponse.statusCode == 200 else {
+            throw APIClient.httpError(data: data, response: httpResponse, domain: "OpenAI")
         }
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -427,15 +517,18 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
     }
 
     private func fetchGeminiModels(apiKey: String) async throws -> [String] {
-        let urlString = "https://generativelanguage.googleapis.com/v1beta/models?key=\(apiKey)"
-        guard let url = URL(string: urlString) else { return [] }
-
+        // The key travels in the x-goog-api-key header, never in the URL.
+        let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models")!
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
+        request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
 
         let (data, response) = try await session.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-            throw NSError(domain: "Gemini", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to fetch models."])
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw APIError.invalidURL(domain: "Gemini")
+        }
+        guard httpResponse.statusCode == 200 else {
+            throw APIClient.httpError(data: data, response: httpResponse, domain: "Gemini")
         }
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -474,8 +567,11 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
 
         let (data, response) = try await session.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-            throw NSError(domain: "Claude", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to fetch models."])
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw APIError.invalidURL(domain: "Claude")
+        }
+        guard httpResponse.statusCode == 200 else {
+            throw APIClient.httpError(data: data, response: httpResponse, domain: "Claude")
         }
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -497,8 +593,11 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
 
         let (data, response) = try await session.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-            throw NSError(domain: "DeepSeek", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to fetch models."])
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw APIError.invalidURL(domain: "DeepSeek")
+        }
+        guard httpResponse.statusCode == 200 else {
+            throw APIClient.httpError(data: data, response: httpResponse, domain: "DeepSeek")
         }
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -520,8 +619,11 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
 
         let (data, response) = try await session.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-            throw NSError(domain: "OpenRouter", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to fetch models."])
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw APIError.invalidURL(domain: "OpenRouter")
+        }
+        guard httpResponse.statusCode == 200 else {
+            throw APIClient.httpError(data: data, response: httpResponse, domain: "OpenRouter")
         }
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -558,6 +660,34 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
         return modelIds
     }
 
+    /// The custom provider's model list: OpenAI-compatible `/models`.
+    private func fetchOpenAICompatibleModels(apiKey: String, baseURL: String) async throws -> [String] {
+        guard let endpoints = CustomEndpoints(baseURL: baseURL) else {
+            throw APIError.invalidURL(domain: "Custom")
+        }
+
+        var request = URLRequest(url: endpoints.models)
+        request.httpMethod = "GET"
+        if !apiKey.isEmpty {
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        }
+
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw APIError.invalidURL(domain: "Custom")
+        }
+        guard httpResponse.statusCode == 200 else {
+            throw APIClient.httpError(data: data, response: httpResponse, domain: "Custom")
+        }
+
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let dataArray = json["data"] as? [[String: Any]] else {
+            return []
+        }
+
+        return dataArray.compactMap { $0["id"] as? String }.sorted()
+    }
+
     // MARK: Send Message
 
     @discardableResult
@@ -565,15 +695,16 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         guard !isGenerating else { return false }
-
-        let apiKey = activeApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !apiKey.isEmpty else {
-            errorMessage = "No API key provided for \(selectedProvider.displayName)."
+        guard isConfigured else {
+            errorMessage = configurationErrorText
             return false
         }
 
+        let apiKey = activeApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+
         let userMsg = ChatMessage(role: .user, content: trimmed)
         messages.append(userMsg)
+        capMessages()
         saveMessages()
         errorMessage = nil
         isGenerating = true
@@ -584,37 +715,40 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
         let currentLanguage = selectedLanguage
         let history = Array(messages.suffix(20))
 
-        Task {
+        let task = Task { [weak self] in
+            guard let self else { return }
             do {
                 let responseText: String
                 switch currentProvider {
                 case .chatGPT:
-                    responseText = try await callChatGPTAPI(apiKey: apiKey, model: currentModel, systemPrompt: currentSystemPrompt, language: currentLanguage, history: history)
+                    responseText = try await self.callChatGPTAPI(apiKey: apiKey, model: currentModel, systemPrompt: currentSystemPrompt, language: currentLanguage, history: history)
                 case .gemini:
-                    responseText = try await callGeminiAPI(apiKey: apiKey, model: currentModel, systemPrompt: currentSystemPrompt, language: currentLanguage, history: history)
+                    responseText = try await self.callGeminiAPI(apiKey: apiKey, model: currentModel, systemPrompt: currentSystemPrompt, language: currentLanguage, history: history)
                 case .claude:
-                    responseText = try await callClaudeAPI(apiKey: apiKey, model: currentModel, systemPrompt: currentSystemPrompt, language: currentLanguage, history: history)
+                    responseText = try await self.callClaudeAPI(apiKey: apiKey, model: currentModel, systemPrompt: currentSystemPrompt, language: currentLanguage, history: history)
                 case .deepseek:
-                    responseText = try await callDeepSeekAPI(apiKey: apiKey, model: currentModel, systemPrompt: currentSystemPrompt, language: currentLanguage, history: history)
+                    responseText = try await self.callDeepSeekAPI(apiKey: apiKey, model: currentModel, systemPrompt: currentSystemPrompt, language: currentLanguage, history: history)
                 case .openRouter:
-                    responseText = try await callOpenRouterAPI(apiKey: apiKey, model: currentModel, systemPrompt: currentSystemPrompt, language: currentLanguage, history: history)
+                    responseText = try await self.callOpenRouterAPI(apiKey: apiKey, model: currentModel, systemPrompt: currentSystemPrompt, language: currentLanguage, history: history)
+                case .custom:
+                    responseText = try await self.callCustomAPI(apiKey: apiKey, model: currentModel, systemPrompt: currentSystemPrompt, language: currentLanguage, history: history)
                 }
 
-                await MainActor.run {
-                    let assistantMsg = ChatMessage(role: .assistant, content: responseText)
-                    self.messages.append(assistantMsg)
-                    self.saveMessages()
-                    self.isGenerating = false
-                }
+                guard self.isActive else { return }
+                let assistantMsg = ChatMessage(role: .assistant, content: responseText)
+                self.messages.append(assistantMsg)
+                self.capMessages()
+                self.saveMessages()
+                self.isGenerating = false
             } catch {
+                guard self.isActive else { return }
                 let masked = self.maskedKey(apiKey)
-                NSLog("[Happy Quick-AI] \(currentProvider.displayName) request failed, key \(masked): \(error.localizedDescription)")
-                await MainActor.run {
-                    self.errorMessage = error.localizedDescription
-                    self.isGenerating = false
-                }
+                self.host?.log.error("\(currentProvider.displayName) request failed, key \(masked): \(error.localizedDescription)")
+                self.errorMessage = error.localizedDescription
+                self.isGenerating = false
             }
         }
+        track(task)
         return true
     }
 
@@ -644,16 +778,11 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
 
         let (data, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
-            throw NSError(domain: "HappyQuickAI", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid HTTP response."])
+            throw APIError.invalidURL(domain: "OpenAI")
         }
 
         guard httpResponse.statusCode == 200 else {
-            if let errObj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let errDict = errObj["error"] as? [String: Any],
-               let errMsg = errDict["message"] as? String {
-                throw NSError(domain: "OpenAI", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: errMsg])
-            }
-            throw NSError(domain: "OpenAI", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: "OpenAI API returned HTTP status \(httpResponse.statusCode)."])
+            throw APIClient.httpError(data: data, response: httpResponse, domain: "OpenAI")
         }
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -661,20 +790,21 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
               let firstChoice = choices.first,
               let message = firstChoice["message"] as? [String: Any],
               let content = message["content"] as? String else {
-            throw NSError(domain: "OpenAI", code: -2, userInfo: [NSLocalizedDescriptionKey: "Failed to parse OpenAI response."])
+            throw APIError.parsing(domain: "OpenAI")
         }
 
         return content
     }
 
     private func callGeminiAPI(apiKey: String, model: String, systemPrompt: String, language: String, history: [ChatMessage]) async throws -> String {
-        let urlString = "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent?key=\(apiKey)"
+        let urlString = "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent"
         guard let url = URL(string: urlString) else {
-            throw NSError(domain: "Gemini", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid Gemini URL."])
+            throw APIError.invalidURL(domain: "Gemini")
         }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
         let contents = history.map { msg -> [String: Any] in
@@ -695,16 +825,11 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
 
         let (data, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
-            throw NSError(domain: "Gemini", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid HTTP response."])
+            throw APIError.invalidURL(domain: "Gemini")
         }
 
         guard httpResponse.statusCode == 200 else {
-            if let errObj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let errDict = errObj["error"] as? [String: Any],
-               let errMsg = errDict["message"] as? String {
-                throw NSError(domain: "Gemini", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: errMsg])
-            }
-            throw NSError(domain: "Gemini", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: "Gemini API returned HTTP status \(httpResponse.statusCode)."])
+            throw APIClient.httpError(data: data, response: httpResponse, domain: "Gemini")
         }
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -714,7 +839,7 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
               let parts = contentObj["parts"] as? [[String: Any]],
               let firstPart = parts.first,
               let text = firstPart["text"] as? String else {
-            throw NSError(domain: "Gemini", code: -2, userInfo: [NSLocalizedDescriptionKey: "Failed to parse Gemini response."])
+            throw APIError.parsing(domain: "Gemini")
         }
 
         return text
@@ -748,23 +873,18 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
 
         let (data, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
-            throw NSError(domain: "Claude", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid HTTP response."])
+            throw APIError.invalidURL(domain: "Claude")
         }
 
         guard httpResponse.statusCode == 200 else {
-            if let errObj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let errMsg = errObj["error"] as? [String: Any],
-               let message = errMsg["message"] as? String {
-                throw NSError(domain: "Claude", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: message])
-            }
-            throw NSError(domain: "Claude", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: "Claude API returned HTTP status \(httpResponse.statusCode)."])
+            throw APIClient.httpError(data: data, response: httpResponse, domain: "Claude")
         }
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let content = json["content"] as? [[String: Any]],
               let firstBlock = content.first,
               let text = firstBlock["text"] as? String else {
-            throw NSError(domain: "Claude", code: -2, userInfo: [NSLocalizedDescriptionKey: "Failed to parse Claude response."])
+            throw APIError.parsing(domain: "Claude")
         }
 
         return text
@@ -794,16 +914,11 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
 
         let (data, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
-            throw NSError(domain: "DeepSeek", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid HTTP response."])
+            throw APIError.invalidURL(domain: "DeepSeek")
         }
 
         guard httpResponse.statusCode == 200 else {
-            if let errObj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let errDict = errObj["error"] as? [String: Any],
-               let errMsg = errDict["message"] as? String {
-                throw NSError(domain: "DeepSeek", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: errMsg])
-            }
-            throw NSError(domain: "DeepSeek", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: "DeepSeek API returned HTTP status \(httpResponse.statusCode)."])
+            throw APIClient.httpError(data: data, response: httpResponse, domain: "DeepSeek")
         }
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -811,7 +926,7 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
               let firstChoice = choices.first,
               let message = firstChoice["message"] as? [String: Any],
               let content = message["content"] as? String else {
-            throw NSError(domain: "DeepSeek", code: -2, userInfo: [NSLocalizedDescriptionKey: "Failed to parse DeepSeek response."])
+            throw APIError.parsing(domain: "DeepSeek")
         }
 
         return content
@@ -843,23 +958,18 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
 
         let (data, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
-            throw NSError(domain: "OpenRouter", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid HTTP response."])
+            throw APIError.invalidURL(domain: "OpenRouter")
         }
 
         guard httpResponse.statusCode == 200 else {
-            if let errObj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let errDict = errObj["error"] as? [String: Any],
-               let errMsg = errDict["message"] as? String {
-                throw NSError(domain: "OpenRouter", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: errMsg])
-            }
-            throw NSError(domain: "OpenRouter", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: "OpenRouter API returned HTTP status \(httpResponse.statusCode)."])
+            throw APIClient.httpError(data: data, response: httpResponse, domain: "OpenRouter")
         }
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let choices = json["choices"] as? [[String: Any]],
               let firstChoice = choices.first,
               let message = firstChoice["message"] as? [String: Any] else {
-            throw NSError(domain: "OpenRouter", code: -2, userInfo: [NSLocalizedDescriptionKey: "Failed to parse OpenRouter response."])
+            throw APIError.parsing(domain: "OpenRouter")
         }
 
         // content is a String for text, or an array of text/image parts.
@@ -870,602 +980,61 @@ public final class HappyQuickAIDroplet: NSObject, ObservableObject, Droplet {
             let texts = parts.compactMap { $0["text"] as? String }
             if !texts.isEmpty { return texts.joined(separator: "\n") }
         }
-        throw NSError(domain: "OpenRouter", code: -2, userInfo: [NSLocalizedDescriptionKey: "Failed to parse OpenRouter response."])
+        throw APIError.parsing(domain: "OpenRouter")
     }
-}
 
-// MARK: - Shelf Widget
+    /// The custom provider's chat call: an OpenAI-compatible
+    /// `/chat/completions` request, with the Bearer key only when one is set.
+    private func callCustomAPI(apiKey: String, model: String, systemPrompt: String, language: String, history: [ChatMessage]) async throws -> String {
+        guard let endpoints = CustomEndpoints(baseURL: customBaseURL) else {
+            throw APIError.invalidURL(domain: "Custom")
+        }
 
-extension HappyQuickAIDroplet: ShelfWidgetProviding {
-    public var widgetDescriptors: [ShelfWidgetDescriptor] {
-        [
-            ShelfWidgetDescriptor(
-                id: "happy-quick-ai",
-                title: "Happy Quick-AI",
-                systemImage: "sparkles",
-                layoutTraits: ShelfWidgetLayoutTraits(
-                    preferredSoloWidth: 420,
-                    preferredPairedWidth: 210,
-                    contentHeight: .fixed(220)
-                ),
-                focusPolicy: .keyboardFocusable
-            )
+        var request = URLRequest(url: endpoints.chat)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if !apiKey.isEmpty {
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        }
+
+        var apiMessages: [[String: String]] = []
+        let fullSystemInstruction = "\(systemPrompt)\nPlease respond in \(language)."
+        apiMessages.append(["role": "system", "content": fullSystemInstruction])
+
+        for msg in history {
+            apiMessages.append(["role": msg.role == .user ? "user" : "assistant", "content": msg.content])
+        }
+
+        let body: [String: Any] = [
+            "model": model,
+            "messages": apiMessages
         ]
-    }
 
-    public func makeWidgetView(_ id: ShelfWidgetID, context: ShelfWidgetContext) -> AnyView {
-        AnyView(HappyQuickAIWidget(droplet: self, context: context))
-    }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-    public func makeWidgetSettingsPopover(_ id: ShelfWidgetID) -> AnyView? { nil }
-}
-
-// MARK: - Chat Widget View
-
-private struct HappyQuickAIWidget: View {
-    @ObservedObject var droplet: HappyQuickAIDroplet
-    let context: ShelfWidgetContext
-
-    @State private var inputText: String = ""
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: DroppySpacing.sm) {
-            headerRow
-
-            if droplet.activeApiKey.isEmpty {
-                unconfiguredView
-            } else if context.isCompact {
-                compactView
-            } else {
-                expandedView
-            }
-        }
-        .padding(context.contentInsets)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-    }
-
-    // MARK: Sub-views
-
-    @ViewBuilder
-    private var headerRow: some View {
-        HStack(spacing: DroppySpacing.xsm) {
-            Image(systemName: "sparkles")
-                .font(.system(size: 12, weight: .medium))
-            Text("Happy Quick-AI")
-                .font(.system(size: 12, weight: .semibold))
-
-            if !context.isCompact {
-                Text(droplet.selectedProvider.displayName)
-                    .font(.system(size: 10, weight: .medium))
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background {
-                        RoundedRectangle(cornerRadius: DroppyRadius.small, style: .continuous)
-                            .fill(AdaptiveColors.notchSurfaceCardFill)
-                    }
-            }
-
-            Spacer(minLength: 0)
-
-            if !context.isCompact {
-                Button {
-                    droplet.clearMessages()
-                } label: {
-                    Image(systemName: "trash")
-                }
-                .buttonStyle(DroppyCircleButtonStyle(size: 20))
-                .help("Clear chat")
-
-                Button {
-                    droplet.openSettings()
-                } label: {
-                    Image(systemName: "gearshape")
-                }
-                .buttonStyle(DroppyCircleButtonStyle(size: 20))
-                .help("Settings")
-            }
-        }
-        .foregroundStyle(AdaptiveColors.notchSurfaceSecondaryText)
-    }
-
-    @ViewBuilder
-    private var unconfiguredView: some View {
-        VStack(spacing: DroppySpacing.sm) {
-            Spacer(minLength: 0)
-            Image(systemName: "key.slash")
-                .font(.system(size: 22, weight: .light))
-                .foregroundStyle(AdaptiveColors.notchSurfaceTertiaryText)
-
-            Text("No API key configured")
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(AdaptiveColors.notchSurfacePrimaryText)
-
-            Text("Set up your \(droplet.selectedProvider.displayName) API key in settings.")
-                .font(.system(size: 11))
-                .foregroundStyle(AdaptiveColors.notchSurfaceSecondaryText)
-                .multilineTextAlignment(.center)
-
-            Button("Open Settings") {
-                droplet.openSettings()
-            }
-            .buttonStyle(DroppyQuietButtonStyle(size: .small))
-            Spacer(minLength: 0)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    @ViewBuilder
-    private var compactView: some View {
-        VStack(alignment: .leading, spacing: DroppySpacing.xsm) {
-            if let last = droplet.messages.last {
-                Text(last.role == .user ? "You:" : "AI:")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(AdaptiveColors.notchSurfaceSecondaryText)
-                Text(last.content)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(AdaptiveColors.notchSurfacePrimaryText)
-                    .lineLimit(3)
-                    .truncationMode(.tail)
-            } else {
-                Text(droplet.selectedProvider.displayName)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(AdaptiveColors.notchSurfacePrimaryText)
-                Text("Start a chat in the full widget")
-                    .font(.system(size: 11))
-                    .foregroundStyle(AdaptiveColors.notchSurfaceTertiaryText)
-                    .lineLimit(1)
-            }
-            Spacer(minLength: 0)
-        }
-    }
-
-    @ViewBuilder
-    private var expandedView: some View {
-        // Chat scroll area
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: DroppySpacing.xs) {
-                    if droplet.messages.isEmpty {
-                        Text("Ask a question to start the conversation…")
-                            .font(.system(size: 12))
-                            .foregroundStyle(AdaptiveColors.notchSurfaceTertiaryText)
-                            .padding(.vertical, DroppySpacing.sm)
-                    } else {
-                        ForEach(droplet.messages) { msg in
-                            messageBubble(msg)
-                        }
-                    }
-
-                    if droplet.isGenerating {
-                        HStack(spacing: DroppySpacing.xs) {
-                            ProgressView()
-                                .scaleEffect(0.6)
-                            Text("Thinking…")
-                                .font(.system(size: 11))
-                                .foregroundStyle(AdaptiveColors.notchSurfaceSecondaryText)
-                        }
-                        .padding(.vertical, 4)
-                        .id("generating")
-                    }
-
-                    if let err = droplet.errorMessage {
-                        Text(err)
-                            .font(.system(size: 11))
-                            .foregroundStyle(Color.red.opacity(0.95))
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 5)
-                            .background {
-                                RoundedRectangle(cornerRadius: DroppyRadius.small, style: .continuous)
-                                    .fill(Color.red.opacity(0.15))
-                            }
-                    }
-                }
-                .padding(.bottom, DroppySpacing.xs)
-            }
-            .onChange(of: droplet.messages.count) { _, _ in
-                if let last = droplet.messages.last {
-                    withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
-                }
-            }
-            .onChange(of: droplet.isGenerating) { _, generating in
-                if generating {
-                    withAnimation { proxy.scrollTo("generating", anchor: .bottom) }
-                }
-            }
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw APIError.invalidURL(domain: "Custom")
         }
 
-        // Input bar — outside ScrollViewReader so it always receives keyboard focus
-        inputBar
-    }
-
-    @ViewBuilder
-    private func messageBubble(_ msg: ChatMessage) -> some View {
-        HStack(alignment: .bottom, spacing: 0) {
-            if msg.role == .user { Spacer(minLength: 24) }
-            Text(msg.content)
-                .font(.system(size: 12))
-                .padding(.horizontal, 10)
-                .padding(.vertical, 7)
-                .background {
-                    RoundedRectangle(cornerRadius: DroppyRadius.medium, style: .continuous)
-                        .fill(
-                            msg.role == .user
-                                ? AdaptiveColors.selectionBlueAuto.opacity(0.85)
-                                : AdaptiveColors.notchSurfaceCardFill
-                        )
-                }
-                .foregroundStyle(
-                    msg.role == .user
-                        ? AdaptiveColors.selectionForegroundAuto
-                        : AdaptiveColors.notchSurfacePrimaryText
-                )
-                .fixedSize(horizontal: false, vertical: true)
-            if msg.role == .assistant { Spacer(minLength: 24) }
-        }
-        .id(msg.id)
-    }
-
-    @ViewBuilder
-    private var inputBar: some View {
-        HStack(spacing: DroppySpacing.xs) {
-            ChatInputField(text: $inputText, onSubmit: { sendCurrentText() })
-                .padding(.horizontal, 10)
-                .padding(.vertical, 7)
-                .background {
-                    RoundedRectangle(cornerRadius: DroppyRadius.medium, style: .continuous)
-                        .fill(AdaptiveColors.notchSurfaceCardFill)
-                }
-
-            Button {
-                sendCurrentText()
-            } label: {
-                Image(systemName: droplet.isGenerating ? "ellipsis" : "paperplane.fill")
-                    .font(.system(size: 11))
-            }
-            .buttonStyle(DroppyCircleButtonStyle(size: 24))
-            .disabled(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || droplet.isGenerating)
-        }
-    }
-
-    private func sendCurrentText() {
-        if droplet.sendMessage(inputText) {
-            inputText = ""
-        }
-    }
-}
-
-// MARK: - Chat Input Field
-
-/// One-line chat input backed by `NSTextField`.
-///
-/// A plain SwiftUI `TextField` cannot be trusted on every host: while the field
-/// is being edited the host is free to swallow the key events at or before its
-/// own event dispatch, so the caret appears and nothing types (observed when
-/// Droppy runs in English but not Spanish). While this field is mid-edit, a
-/// local key monitor feeds every keystroke straight into the field editor and
-/// consumes it, so typing works identically in every host language and the
-/// host's own focus cycle never has a chance to eat it.
-private struct ChatInputField: NSViewRepresentable {
-    @Binding var text: String
-    var onSubmit: () -> Void
-
-    func makeCoordinator() -> Coordinator { Coordinator(self) }
-
-    func makeNSView(context: Context) -> NSTextField {
-        let field = NSTextField()
-        field.isBordered = false
-        field.isBezeled = false
-        field.drawsBackground = false
-        field.focusRingType = .none
-        field.font = .systemFont(ofSize: 12)
-        field.placeholderString = "Ask AI…"
-        field.textColor = .white
-        field.alignment = .left
-        field.delegate = context.coordinator
-        field.target = context.coordinator
-        field.action = #selector(Coordinator.submit(_:))
-        context.coordinator.install(on: field)
-        return field
-    }
-
-    func updateNSView(_ nsView: NSTextField, context: Context) {
-        context.coordinator.parent = self
-        if nsView.stringValue != text {
-            nsView.stringValue = text
-        }
-    }
-
-    static func dismantleNSView(_ nsView: NSTextField, coordinator: Coordinator) {
-        coordinator.teardown()
-    }
-
-    @MainActor final class Coordinator: NSObject, NSTextFieldDelegate {
-        var parent: ChatInputField
-        private weak var field: NSTextField?
-        private var keyMonitor: Any?
-        private var didMakeKey = false
-
-        init(_ parent: ChatInputField) {
-            self.parent = parent
+        guard httpResponse.statusCode == 200 else {
+            throw APIClient.httpError(data: data, response: httpResponse, domain: "Custom")
         }
 
-        func install(on field: NSTextField) {
-            self.field = field
-            // Must return the coordinator's decision verbatim: `nil` swallows the
-            // event, anything else lets it keep its normal route. Returning the
-            // event here when the handler chose `nil` redelivers the keystroke to
-            // the field editor, which inserts it a second time.
-            keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-                guard let self else { return event }
-                return self.handleKeyDown(event)
-            }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let choices = json["choices"] as? [[String: Any]],
+              let firstChoice = choices.first,
+              let message = firstChoice["message"] as? [String: Any] else {
+            throw APIError.parsing(domain: "Custom")
         }
 
-        func teardown() {
-            if let keyMonitor {
-                NSEvent.removeMonitor(keyMonitor)
-            }
-            keyMonitor = nil
-            field = nil
+        if let text = message["content"] as? String {
+            return text
         }
-
-        private func handleKeyDown(_ event: NSEvent) -> NSEvent? {
-            // No dependence on NSApp.isActive: a floating shelf/hud panel can be
-            // editing while the app is not the global active app.
-            guard let field, let editor = field.currentEditor() as? NSTextView else { return event }
-            // Command/control combinations keep their normal route (copy, paste, menus).
-            if !event.modifierFlags.intersection([.command, .control]).isEmpty { return event }
-
-            switch event.keyCode {
-            case 36, 76: // Return / keypad Enter — submit and keep focus.
-                parent.onSubmit()
-                return nil
-            case 48: // Tab — keep the host's focus cycle.
-                return event
-            case 53: // Escape — keep the host's route.
-                return event
-            case 51: // Delete.
-                editor.deleteBackward(nil)
-                return nil
-            case 123, 124, 125, 126: // Arrow keys move the caret.
-                editor.interpretKeyEvents([event])
-                return nil
-            default:
-                // Every other key is written straight into the field editor.
-                // The monitor runs before the host dispatches the event, so the
-                // text lands even when the host would swallow the keystroke.
-                if let chars = event.characters ?? event.charactersIgnoringModifiers, !chars.isEmpty {
-                    // Never inject control characters (deletions, function keys,
-                    // Option-generated control codes) as literal text.
-                    if chars.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) {
-                        editor.insertText(chars, replacementRange: editor.selectedRange())
-                        return nil
-                    }
-                }
-                return event
-            }
+        if let parts = message["content"] as? [[String: Any]] {
+            let texts = parts.compactMap { $0["text"] as? String }
+            if !texts.isEmpty { return texts.joined(separator: "\n") }
         }
-
-        func controlTextDidBeginEditing(_ obj: Notification) {
-            guard let field, let editor = field.currentEditor() as? NSTextView else { return }
-            editor.insertionPointColor = .white
-            if !didMakeKey, let window = field.window {
-                window.makeKey()
-                window.makeFirstResponder(field)
-                didMakeKey = true
-            }
-        }
-
-        func controlTextDidChange(_ obj: Notification) {
-            guard let field else { return }
-            parent.text = field.stringValue
-        }
-
-        @objc func submit(_ sender: Any?) {
-            parent.onSubmit()
-        }
-    }
-}
-
-// MARK: - Settings Pane
-
-extension HappyQuickAIDroplet: SettingsPaneProviding {
-    public func makeSettingsPane(context: SettingsPaneContext) -> AnyView {
-        AnyView(HappyQuickAISettings(droplet: self))
-    }
-
-    public var settingsSearchEntries: [SettingsSearchEntry] {
-        [
-            SettingsSearchEntry(title: "Provider & model", keywords: ["provider", "chatgpt", "gemini", "claude", "anthropic", "deepseek", "openrouter", "openai", "model"]),
-            SettingsSearchEntry(title: "API key", keywords: ["api", "key", "token", "auth", "secret", "connection", "test"]),
-            SettingsSearchEntry(title: "Language & system prompt", keywords: ["system", "prompt", "language", "idioma"]),
-            SettingsSearchEntry(title: "Chat history", keywords: ["history", "clear", "messages"])
-        ]
-    }
-}
-
-private struct HappyQuickAISettings: View {
-    @ObservedObject var droplet: HappyQuickAIDroplet
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: DroppySpacing.lg) {
-
-            // Card 1 — Provider & model
-            DropletSettingsCard {
-                DropletControlRow(title: "Provider") {
-                    Picker("", selection: Binding(
-                        get: { droplet.selectedProvider },
-                        set: { droplet.selectedProvider = $0 }
-                    )) {
-                        ForEach(AIProvider.allCases) { provider in
-                            Text(provider.displayName).tag(provider)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    .frame(maxWidth: 180, alignment: .trailing)
-                }
-
-                DropletSettingsDivider()
-
-                DropletControlRow(title: "Model", infoTip: "Fetch available models from the API or pick from defaults") {
-                    HStack(spacing: DroppySpacing.xs) {
-                        Picker("", selection: Binding(
-                            get: { droplet.selectedModel },
-                            set: { droplet.selectedModel = $0 }
-                        )) {
-                            if droplet.availableModels.isEmpty {
-                                Text(droplet.isFetchingModels ? "Fetching…" : "Fetch to list")
-                                    .tag(droplet.selectedModel)
-                            } else {
-                                ForEach(droplet.availableModels, id: \.self) { model in
-                                    Text(model).tag(model)
-                                }
-                            }
-                        }
-                        .pickerStyle(.menu)
-                        .frame(maxWidth: 240, alignment: .trailing)
-
-                        Button {
-                            droplet.updateAvailableModelsList()
-                        } label: {
-                            if droplet.isFetchingModels {
-                                ProgressView().scaleEffect(0.7)
-                            } else {
-                                Image(systemName: "arrow.clockwise")
-                                    .font(.system(size: 11))
-                            }
-                        }
-                        .buttonStyle(DroppyCircleButtonStyle(size: 24))
-                        .help("Fetch models from API")
-                        .disabled(droplet.isFetchingModels)
-                    }
-
-                    if let fetchError = droplet.modelsFetchError {
-                        Text(fetchError)
-                            .font(.system(size: 11))
-                            .foregroundStyle(Color.red.opacity(0.95))
-                            .lineLimit(3)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .padding(.top, DroppySpacing.xs)
-                    }
-                }
-            }
-
-            // Card 2 — API key
-            DropletSettingsCard {
-                switch droplet.selectedProvider {
-                case .chatGPT:
-                    DropletStackedRow(title: "ChatGPT API key", infoTip: "Your OpenAI secret key starting with sk-…") {
-                        SecureField("sk-…", text: Binding(
-                            get: { droplet.chatgptApiKey },
-                            set: { droplet.chatgptApiKey = $0 }
-                        ))
-                        .textFieldStyle(.roundedBorder)
-                    }
-                case .gemini:
-                    DropletStackedRow(title: "Gemini API key", infoTip: "Your Google Gemini key starting with AIza…") {
-                        SecureField("AIza…", text: Binding(
-                            get: { droplet.geminiApiKey },
-                            set: { droplet.geminiApiKey = $0 }
-                        ))
-                        .textFieldStyle(.roundedBorder)
-                    }
-                case .claude:
-                    DropletStackedRow(title: "Claude API key", infoTip: "Your Anthropic key starting with sk-ant-…") {
-                        SecureField("sk-ant-…", text: Binding(
-                            get: { droplet.claudeApiKey },
-                            set: { droplet.claudeApiKey = $0 }
-                        ))
-                        .textFieldStyle(.roundedBorder)
-                    }
-                case .deepseek:
-                    DropletStackedRow(title: "DeepSeek API key", infoTip: "Your DeepSeek platform key starting with sk-…") {
-                        SecureField("sk-…", text: Binding(
-                            get: { droplet.deepseekApiKey },
-                            set: { droplet.deepseekApiKey = $0 }
-                        ))
-                        .textFieldStyle(.roundedBorder)
-                    }
-                case .openRouter:
-                    DropletStackedRow(title: "OpenRouter API key", infoTip: "One key for hundreds of hosted models, starting with sk-or-…") {
-                        SecureField("sk-or-…", text: Binding(
-                            get: { droplet.openRouterApiKey },
-                            set: { droplet.openRouterApiKey = $0 }
-                        ))
-                        .textFieldStyle(.roundedBorder)
-                    }
-                }
-
-                DropletSettingsDivider()
-
-                DropletControlRow(title: "Connection", infoTip: "Sends your stored key to the provider to confirm it is valid") {
-                    HStack(spacing: DroppySpacing.xs) {
-                        if droplet.isTestingConnection {
-                            ProgressView().scaleEffect(0.6)
-                        }
-                        Button("Test") {
-                            Task { await droplet.testConnection() }
-                        }
-                        .buttonStyle(DroppyQuietButtonStyle(size: .small))
-                        .disabled(droplet.isTestingConnection)
-                    }
-                }
-
-                if let status = droplet.connectionStatus {
-                    Text(status)
-                        .font(.system(size: 11))
-                        .foregroundStyle(status.hasPrefix("OK") ? Color.green.opacity(0.95) : Color.red.opacity(0.95))
-                        .multilineTextAlignment(.center)
-                        .lineLimit(3)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: .infinity)
-                        .padding(.top, DroppySpacing.xs)
-                }
-            }
-
-            // Card 3 — Language & system prompt
-            DropletSettingsCard {
-                DropletControlRow(title: "Output language", infoTip: "Language the AI will respond in") {
-                    Picker("", selection: Binding(
-                        get: { droplet.selectedLanguage },
-                        set: { droplet.selectedLanguage = $0 }
-                    )) {
-                        ForEach(HappyQuickAIDroplet.supportedLanguages, id: \.self) { lang in
-                            Text(lang).tag(lang)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    .frame(maxWidth: 130)
-                }
-
-                DropletSettingsDivider()
-
-                DropletStackedRow(title: "System prompt", infoTip: "Instruction that shapes the AI's personality and behaviour") {
-                    TextField("System prompt…", text: Binding(
-                        get: { droplet.systemPrompt },
-                        set: { droplet.systemPrompt = $0 }
-                    ), axis: .vertical)
-                    .lineLimit(3...6)
-                    .textFieldStyle(.roundedBorder)
-                }
-            }
-
-            // Card 4 — Chat history
-            DropletSettingsCard {
-                DropletControlRow(title: "Messages") {
-                    DropletValuePill(text: "\(droplet.messages.count)")
-                }
-
-                DropletSettingsDivider()
-
-                DropletControlRow(title: "Clear history") {
-                    Button("Clear") {
-                        droplet.clearMessages()
-                    }
-                    .buttonStyle(DroppyQuietButtonStyle(size: .small))
-                }
-            }
-        }
-        .onAppear { droplet.updateAvailableModelsList() }
+        throw APIError.parsing(domain: "Custom")
     }
 }
